@@ -10,6 +10,299 @@
 #include "convert.h"
 #include "generated/static_bases.gen.h"
 #include <string>
+#include <Windows.h>
+
+// PrismaUI keyboard integration (Skyrim VR)
+#include "Misc/Keyboard/PrismaUI_API.h"
+
+static PRISMA_UI_API::IVPrismaUI1* g_prisma = nullptr;
+static PrismaView g_keyboardView = 0;
+static bool g_prismaChecked = false;
+static bool g_prismaAvailable = false;
+static std::string g_prismaKeyboardResult;
+static bool g_prismaKeyboardDone = false;
+static bool g_prismaKeyboardActive = false;
+
+// Store the event dispatch callback so the static JS callback can fire VREvent_KeyboardDone
+// directly into the game's event queue when the user submits text.
+// This is critical: Skyrim polls PollNextEvent() waiting for VREvent_KeyboardDone
+// BEFORE it ever calls GetKeyboardText(). If we only fire the event inside
+// GetKeyboardText(), the game deadlocks waiting for an event that never arrives.
+static VRKeyboard::eventDispatch_t g_pendingKeyboardDispatch;
+static uint64_t g_pendingKeyboardUserValue = 0;
+
+// Forward declaration for the JS submit callback
+static void OnPrismaKeyboardSubmit(const char* text);
+
+static bool IsSkyrimVR() {
+	static int cached = -1;
+	if (cached == -1) {
+		char exeName[MAX_PATH];
+		GetModuleFileNameA(NULL, exeName, MAX_PATH);
+		cached = (strstr(exeName, "SkyrimVR") != nullptr) ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+// Detect if Skyrim VR has a game-pausing menu open (inventory, MCM, journal, etc.)
+// Reads directly from Skyrim VR's UI singleton in memory.
+// UI singleton offset: 0x1F83200 (from SkyrimVR.exe base)
+// numPausesGame offset: 0x160 (within UI class)
+static bool IsSkyrimMenuOpen() {
+	if (!IsSkyrimVR()) return false;
+
+	static uintptr_t moduleBase = 0;
+	if (!moduleBase) {
+		moduleBase = (uintptr_t)GetModuleHandleA("SkyrimVR.exe");
+		if (!moduleBase) return false;
+	}
+
+	// Read the UI singleton pointer
+	uintptr_t uiPtr = *(uintptr_t*)(moduleBase + 0x1F83200);
+	if (!uiPtr) return false;
+
+	// numPausesGame: counts how many open menus have the "pause game" flag.
+	// If > 0, a menu like inventory, journal, MCM, crafting, etc. is open.
+	uint32_t numPaused = *(uint32_t*)(uiPtr + 0x160);
+	return numPaused > 0;
+}
+
+static bool InitPrismaUI() {
+	if (g_prismaChecked) return g_prismaAvailable;
+	g_prismaChecked = true;
+
+	if (!IsSkyrimVR()) {
+		g_prismaAvailable = false;
+		return false;
+	}
+
+	auto api = PRISMA_UI_API::RequestPluginAPI(PRISMA_UI_API::InterfaceVersion::V1);
+	if (!api) {
+		g_prismaAvailable = false;
+		return false;
+	}
+
+	g_prisma = static_cast<PRISMA_UI_API::IVPrismaUI1*>(api);
+
+	// Create the keyboard view (hidden initially)
+	g_keyboardView = g_prisma->CreateView("oc-keyboard/index.html", nullptr);
+	if (g_keyboardView) {
+		g_prisma->Hide(g_keyboardView);
+		g_prisma->RegisterJSListener(g_keyboardView, "onKeyboardSubmit", OnPrismaKeyboardSubmit);
+		g_prismaAvailable = true;
+	}
+
+	return g_prismaAvailable;
+}
+
+static void OnPrismaKeyboardSubmit(const char* text) {
+	g_prismaKeyboardResult = text ? text : "";
+	g_prismaKeyboardDone = true;
+	g_prismaKeyboardActive = false;
+
+	// Hide the keyboard overlay
+	if (g_prisma && g_keyboardView) {
+		g_prisma->Unfocus(g_keyboardView);
+		g_prisma->Hide(g_keyboardView);
+	}
+
+	// CRITICAL: Fire VREvent_KeyboardDone immediately into the game's event queue.
+	// Skyrim's game loop is: ShowKeyboard() -> poll PollNextEvent() waiting for
+	// VREvent_KeyboardDone -> THEN call GetKeyboardText().
+	// If we wait until GetKeyboardText() to fire the event, we deadlock because
+	// Skyrim never calls GetKeyboardText() until it sees the event first.
+	if (g_pendingKeyboardDispatch) {
+		vr::VREvent_Keyboard_t data = { 0 };
+		data.uUserValue = g_pendingKeyboardUserValue;
+
+		vr::VREvent_t evt = { 0 };
+		evt.eventType = vr::VREvent_KeyboardDone;
+		evt.trackedDeviceIndex = 0;
+		evt.data.keyboard = data;
+
+		g_pendingKeyboardDispatch(evt);
+		g_pendingKeyboardDispatch = nullptr;  // Clear after firing
+	}
+}
+
+// ============================================================================
+// VR Cursor System — translates controller aim to screen cursor for PrismaUI
+// Both controllers can aim and click independently. Whichever hand is pointing
+// closer to the center of the screen wins cursor control that frame.
+//
+// Activates when:
+//   1. PrismaUI keyboard is shown (g_prismaKeyboardActive), OR
+//   2. An external SKSE plugin calls OC_SetVRCursorActive(true)
+//      (e.g., WondernuttsUI enables it when MCM or other menus open)
+// ============================================================================
+
+// External flag — SKSE plugins call OC_SetVRCursorActive() to toggle this
+static bool g_vrCursorForced = false;
+
+// Exported API: any DLL in the process can call this to enable/disable VR cursor.
+// Use case: SKSE plugin detects MCM menu opened → calls OC_SetVRCursorActive(true)
+//           SKSE plugin detects MCM menu closed → calls OC_SetVRCursorActive(false)
+extern "C" __declspec(dllexport) void OC_SetVRCursorActive(bool active) {
+	g_vrCursorForced = active;
+}
+
+static float VRCursor_Dot(float ax, float ay, float az, float bx, float by, float bz) {
+	return ax * bx + ay * by + az * bz;
+}
+
+// Per-hand trigger state for edge detection
+static bool g_vrTriggerDown[2] = { false, false }; // [0]=left, [1]=right
+
+// Which hand currently controls the cursor (-1=none, 0=left, 1=right)
+static int g_vrActiveHand = -1;
+
+// Try to project one controller's aim onto the virtual screen.
+// Returns true if the aim hits the screen, and fills normX/normY (0..1).
+static bool VRCursor_ProjectController(
+    const vr::HmdMatrix34_t& ctrlM,
+    float hmdPx, float hmdPy, float hmdPz,
+    float hmdFx, float hmdFy, float hmdFz,
+    float hmdRx, float hmdRy, float hmdRz,
+    float hmdUx, float hmdUy, float hmdUz,
+    float& normX, float& normY, float& distFromCenter)
+{
+	// Controller position and aim direction (-Z = forward)
+	float cpX = ctrlM.m[0][3], cpY = ctrlM.m[1][3], cpZ = ctrlM.m[2][3];
+	float cfX = -ctrlM.m[0][2], cfY = -ctrlM.m[1][2], cfZ = -ctrlM.m[2][2];
+
+	// Virtual screen plane: 2m in front of HMD
+	float screenDist = 2.0f;
+	float pcX = hmdPx + hmdFx * screenDist;
+	float pcY = hmdPy + hmdFy * screenDist;
+	float pcZ = hmdPz + hmdFz * screenDist;
+
+	float pnX = -hmdFx, pnY = -hmdFy, pnZ = -hmdFz;
+
+	// Ray-plane intersection
+	float dX = pcX - cpX, dY = pcY - cpY, dZ = pcZ - cpZ;
+	float denom = VRCursor_Dot(cfX, cfY, cfZ, pnX, pnY, pnZ);
+	if (fabsf(denom) < 0.001f) return false;
+
+	float t = VRCursor_Dot(dX, dY, dZ, pnX, pnY, pnZ) / denom;
+	if (t < 0.0f) return false;
+
+	float hitX = cpX + cfX * t;
+	float hitY = cpY + cfY * t;
+	float hitZ = cpZ + cfZ * t;
+
+	float locX = hitX - pcX, locY = hitY - pcY, locZ = hitZ - pcZ;
+	float u = VRCursor_Dot(locX, locY, locZ, hmdRx, hmdRy, hmdRz);
+	float v = VRCursor_Dot(locX, locY, locZ, hmdUx, hmdUy, hmdUz);
+
+	// Virtual screen size at 2m (~90° FOV, 16:9)
+	float screenW = 4.0f;
+	float screenH = 2.25f;
+
+	normX = (u / screenW) + 0.5f;
+	normY = 1.0f - ((v / screenH) + 0.5f);
+
+	// Distance from screen center (for picking which hand wins)
+	distFromCenter = sqrtf((normX - 0.5f) * (normX - 0.5f) + (normY - 0.5f) * (normY - 0.5f));
+
+	return (normX >= 0.0f && normX <= 1.0f && normY >= 0.0f && normY <= 1.0f);
+}
+
+void UpdatePrismaKeyboardCursor()
+{
+	// Cursor activates when ANY of these are true:
+	//   1. PrismaUI keyboard is shown
+	//   2. External SKSE plugin called OC_SetVRCursorActive(true)
+	//   3. Skyrim VR has a game-pausing menu open (MCM, inventory, journal, etc.)
+	if (!g_prismaKeyboardActive && !g_vrCursorForced && !IsSkyrimMenuOpen()) return;
+
+	BaseSystem* sys = GetUnsafeBaseSystem();
+	if (!sys) return;
+
+	// Get HMD (0), left controller (1), right controller (2) poses
+	vr::TrackedDevicePose_t poses[3];
+	sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, poses, 3);
+
+	if (!poses[0].bPoseIsValid) return;
+
+	const auto& hmdM = poses[0].mDeviceToAbsoluteTracking;
+
+	// HMD basis
+	float hmdPx = hmdM.m[0][3], hmdPy = hmdM.m[1][3], hmdPz = hmdM.m[2][3];
+	float hmdRx = hmdM.m[0][0], hmdRy = hmdM.m[1][0], hmdRz = hmdM.m[2][0];
+	float hmdUx = hmdM.m[0][1], hmdUy = hmdM.m[1][1], hmdUz = hmdM.m[2][1];
+	float hmdFx = -hmdM.m[0][2], hmdFy = -hmdM.m[1][2], hmdFz = -hmdM.m[2][2];
+
+	// Try both controllers — pick whichever is pointing closer to screen center
+	const vr::TrackedDeviceIndex_t handIdx[2] = { 1, 2 }; // left=1, right=2
+	float bestNormX = 0, bestNormY = 0;
+	float bestDist = 999.0f;
+	int bestHand = -1;
+
+	for (int h = 0; h < 2; h++) {
+		if (!poses[handIdx[h]].bPoseIsValid) continue;
+
+		float nx, ny, dist;
+		if (VRCursor_ProjectController(
+		        poses[handIdx[h]].mDeviceToAbsoluteTracking,
+		        hmdPx, hmdPy, hmdPz,
+		        hmdFx, hmdFy, hmdFz,
+		        hmdRx, hmdRy, hmdRz,
+		        hmdUx, hmdUy, hmdUz,
+		        nx, ny, dist)) {
+			if (dist < bestDist) {
+				bestDist = dist;
+				bestNormX = nx;
+				bestNormY = ny;
+				bestHand = h;
+			}
+		}
+	}
+
+	if (bestHand == -1) return;
+	g_vrActiveHand = bestHand;
+
+	// Map to game window pixel coordinates
+	HWND hwnd = GetForegroundWindow();
+	if (!hwnd) return;
+
+	RECT rect;
+	GetClientRect(hwnd, &rect);
+	POINT origin = { 0, 0 };
+	ClientToScreen(hwnd, &origin);
+
+	int winW = rect.right - rect.left;
+	int winH = rect.bottom - rect.top;
+	if (winW <= 0 || winH <= 0) return;
+
+	int pixX = origin.x + (int)(bestNormX * winW);
+	int pixY = origin.y + (int)(bestNormY * winH);
+
+	SetCursorPos(pixX, pixY);
+
+	// Check BOTH triggers — either hand can click
+	for (int h = 0; h < 2; h++) {
+		if (!poses[handIdx[h]].bPoseIsValid) continue;
+
+		vr::VRControllerState_t state = {};
+		if (sys->GetControllerState(handIdx[h], &state, sizeof(state))) {
+			float trigger = state.rAxis[1].x;
+
+			if (trigger > 0.8f && !g_vrTriggerDown[h]) {
+				g_vrTriggerDown[h] = true;
+				INPUT inp = {};
+				inp.type = INPUT_MOUSE;
+				inp.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+				SendInput(1, &inp, sizeof(INPUT));
+			} else if (trigger < 0.3f && g_vrTriggerDown[h]) {
+				g_vrTriggerDown[h] = false;
+				INPUT inp = {};
+				inp.type = INPUT_MOUSE;
+				inp.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+				SendInput(1, &inp, sizeof(INPUT));
+			}
+		}
+	}
+}
 
 using glm::mat4;
 using glm::vec3;
@@ -812,8 +1105,38 @@ EVROverlayError BaseOverlay::ShowKeyboardWithDispatch(EGamepadTextInputMode eInp
     const char* pchDescription, uint32_t unCharMax, const char* pchExistingText, bool bUseMinimalMode, uint64_t uUserValue,
     VRKeyboard::eventDispatch_t eventDispatch)
 {
-	// Submit a KeyboardDone event since the actual keyboard is not implemented yet.  This allows certain games to still proceed instead of crash.
+	// Try PrismaUI keyboard for Skyrim VR
+	if (InitPrismaUI() && g_prisma && g_keyboardView) {
+		// Store the dispatch callback in static globals so the OnPrismaKeyboardSubmit
+		// callback can fire VREvent_KeyboardDone directly into the game's event queue
+		g_pendingKeyboardDispatch = eventDispatch;
+		g_pendingKeyboardUserValue = uUserValue;
+		g_prismaKeyboardActive = true;
+		g_prismaKeyboardDone = false;
+		g_prismaKeyboardResult.clear();
+
+		// Pre-fill existing text if provided (escape single quotes for JS)
+		if (pchExistingText && pchExistingText[0] != '\0') {
+			std::string escaped;
+			for (const char* p = pchExistingText; *p; ++p) {
+				if (*p == '\'' || *p == '\\') escaped += '\\';
+				escaped += *p;
+			}
+			std::string js = "window.setText('";
+			js += escaped;
+			js += "')";
+			g_prisma->Invoke(g_keyboardView, js.c_str(), nullptr);
+		}
+
+		g_prisma->Show(g_keyboardView);
+		g_prisma->Focus(g_keyboardView, true, false);
+
+		return VROverlayError_None;
+	}
+
+	// Fallback: PrismaUI not available — use placeholder to prevent crash
 	SubmitPlaceholderKeyboardEvent(VREvent_KeyboardDone, eventDispatch, uUserValue);
+	keyboardCache = "Adventurer";
 
 #ifndef OC_XR_PORT
 	if (!BaseCompositor::dxcomp)
@@ -822,7 +1145,6 @@ EVROverlayError BaseOverlay::ShowKeyboardWithDispatch(EGamepadTextInputMode eInp
 	if (eLineInputMode != k_EGamepadTextInputLineModeSingleLine)
 		OOVR_ABORTF("Only single-line keyboard entry mode is currently supported (as opposed to ID=%d)", eLineInputMode);
 
-	// TODO use description
 	keyboard = make_unique<VRKeyboard>(BaseCompositor::dxcomp->GetDevice(), uUserValue, unCharMax, bUseMinimalMode, eventDispatch,
 	    (VRKeyboard::EGamepadTextInputMode)eInputMode);
 
@@ -891,22 +1213,33 @@ EVROverlayError BaseOverlay::ShowKeyboardForOverlay(VROverlayHandle_t ulOverlayH
 }
 uint32_t BaseOverlay::GetKeyboardText(char* pchText, uint32_t cchText)
 {
+	// If PrismaUI keyboard submitted a result, use it.
+	// VREvent_KeyboardDone was already fired by OnPrismaKeyboardSubmit() directly
+	// into the event queue, so Skyrim has already received the event before calling
+	// this function. We just need to hand back the text.
+	if (g_prismaKeyboardDone) {
+		keyboardCache = g_prismaKeyboardResult;
+		g_prismaKeyboardDone = false;
+	}
+
 	string str = keyboard ? VRKeyboard::CHAR_CONV.to_bytes(keyboard->contents()) : keyboardCache;
 
-	// Since keyboard is not functional yet, return this configurable default text
-	str = oovr_global_configuration.KeyboardText();
-
-	// FFS, strncpy is secure.
 	strncpy_s(pchText, cchText, str.c_str(), cchText);
-
-	// Ensure the array always ends in a NULL
 	pchText[cchText - 1] = 0;
 
-	// TODO is this supposed to return the length of the string including or excluding the cchText limit?
 	return (uint32_t)strlen(pchText);
 }
 void BaseOverlay::HideKeyboard()
 {
+	// If PrismaUI keyboard is active, hide it and clear state
+	if (g_prismaKeyboardActive && g_prisma && g_keyboardView) {
+		g_prisma->Unfocus(g_keyboardView);
+		g_prisma->Hide(g_keyboardView);
+		g_prismaKeyboardActive = false;
+		g_pendingKeyboardDispatch = nullptr;
+		return;
+	}
+
 	// First, if the keyboard is currently open, cache it's contents
 	if (keyboard) {
 		keyboardCache = VRKeyboard::CHAR_CONV.to_bytes(keyboard->contents());

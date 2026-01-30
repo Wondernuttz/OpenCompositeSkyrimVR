@@ -13,6 +13,9 @@
 #include <cinttypes>
 #include <string>
 
+// PrismaUI VR cursor update — defined in BaseOverlay.cpp
+extern void UpdatePrismaKeyboardCursor();
+
 #ifdef SUPPORT_DX
 #include <dxgi.h> // for GetDefaultAdapterLuid
 #pragma comment(lib, "dxgi.lib")
@@ -622,6 +625,8 @@ void BaseSystem::CheckControllerEvents(TrackedDeviceIndex_t hand, VRControllerSt
 
 bool BaseSystem::PollNextEvent(VREvent_t* pEvent, uint32_t uncbVREvent)
 {
+	// Update PrismaUI keyboard cursor from VR controller aim (runs every frame)
+	UpdatePrismaKeyboardCursor();
 	return PollNextEventWithPose(TrackingUniverseStanding, pEvent, uncbVREvent, NULL);
 }
 
