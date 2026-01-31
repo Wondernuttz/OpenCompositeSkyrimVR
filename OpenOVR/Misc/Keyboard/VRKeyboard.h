@@ -57,6 +57,7 @@ private:
 	bool closed = false;
 
 	std::wstring text;
+	int cursorPos = 0; // insertion point: 0 = before first char, text.size() = after last
 	ECaseMode caseMode = LOWER;
 
 	uint64_t userValue; // Arbitary user data, to be passed into the SteamVR events
@@ -68,7 +69,7 @@ private:
 	// OpenXR swap chain and composition layer
 	XrSwapchain chain = XR_NULL_HANDLE;
 	uint32_t texWidth = 1024;
-	uint32_t texHeight = 512;
+	uint32_t texHeight = 478;
 	XrCompositionLayerQuad layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	std::vector<XrSwapchainImageD3D11KHR> swapchainImages;
 
@@ -80,6 +81,20 @@ private:
 	int repeatCount[2];
 	int selected[2];
 	uint64_t lastButtonState[2];
+
+	// Grab bar — trigger on the top strip to grab and reposition the keyboard
+	static constexpr int GRAB_BAR_HEIGHT = 52; // pixels at top of texture
+	static constexpr int TOGGLE_BTN_WIDTH = 120; // headlock toggle button width
+	bool grabActive = false;
+	int grabbingSide = -1;
+	XrVector3f grabOffset = {};      // offset from laser hit to keyboard center
+	XrVector3f grabPlaneOrigin = {}; // keyboard center when grab started (reference plane)
+	bool lastTriggerState[2] = { false, false };
+	bool laserOnGrabBar[2] = { false, false };
+	bool laserOnToggle[2] = { false, false };
+	bool laserOnTextBar[2] = { false, false };
+	bool headLocked = false; // true = head-locked (viewSpace), false = world-anchored (floorSpace)
+	XrVector3f headWorldPos = {}; // Head position in world/view space, updated each frame
 
 	// Laser pointer data
 	bool laserActive[2] = { false, false };

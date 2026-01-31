@@ -14,6 +14,7 @@
 
 #include "resources.h"
 
+#include <cmath>
 #include <vector>
 
 #ifdef _WIN32
@@ -99,26 +100,65 @@ VRKeyboard::VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength
 	OOVR_FAILED_XR_ABORT(xrEnumerateSwapchainImages(chain,
 	    swapchainImages.size(), &imageCount, (XrSwapchainImageBaseHeader*)swapchainImages.data()));
 
-	// Set up the OpenXR composition layer quad — HEAD-LOCKED
-	// Using viewSpace means the keyboard stays fixed in front of the player's face
-	// regardless of head movement.
+	// Set up the OpenXR composition layer quad — WORLD-ANCHORED
+	// Using floorSpace (stage) so the keyboard stays fixed in world space.
+	// The user can grab the top bar and reposition it.
 	memset(&layer, 0, sizeof(layer));
 	layer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
 	layer.next = nullptr;
 	layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-	layer.space = xr_gbl->viewSpace; // Head-locked: moves with the headset
+	layer.space = xr_gbl->floorSpace; // World-anchored: stays in place
 	layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 	layer.subImage.swapchain = chain;
 	layer.subImage.imageRect.offset = { 0, 0 };
 	layer.subImage.imageRect.extent = { (int32_t)texWidth, (int32_t)texHeight };
 	layer.subImage.imageArrayIndex = 0;
 
-	// 80cm wide, 48cm tall — positioned 80cm in front, below eye level
-	// Pushed further back so the keyboard sits behind outstretched hands
 	layer.size.width = 0.80f;
-	layer.size.height = 0.48f;
-	layer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f }; // Identity — facing the viewer
-	layer.pose.position = { 0.0f, -0.35f, -0.80f }; // Centered, lowered — behind outstretched hands
+	layer.size.height = 0.37f;
+
+	// Spawn the keyboard in front of the player's current head position
+	XrSpaceLocation headLoc = { XR_TYPE_SPACE_LOCATION };
+	XrResult headResult = xrLocateSpace(xr_gbl->viewSpace, xr_gbl->floorSpace,
+	    xr_gbl->GetBestTime(), &headLoc);
+
+	if (XR_SUCCEEDED(headResult)
+	    && (headLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+	    && (headLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+		// Head forward direction projected to horizontal plane (yaw only)
+		XrVector3f headFwd;
+		XrVector3f localFwd = { 0.0f, 0.0f, -1.0f };
+		rotate_vector_by_quaternion(localFwd, headLoc.pose.orientation, headFwd);
+		headFwd.y = 0;
+		float fwdLen = sqrtf(headFwd.x * headFwd.x + headFwd.z * headFwd.z);
+		if (fwdLen > 0.001f) {
+			headFwd.x /= fwdLen;
+			headFwd.z /= fwdLen;
+		} else {
+			headFwd = { 0.0f, 0.0f, -1.0f };
+		}
+
+		// Position: 80cm forward, 35cm below head
+		layer.pose.position = {
+			headLoc.pose.position.x + headFwd.x * 0.80f,
+			headLoc.pose.position.y - 0.35f,
+			headLoc.pose.position.z + headFwd.z * 0.80f
+		};
+
+		// Orientation: face toward the user (rotate around Y axis)
+		float yaw = atan2f(headFwd.x, headFwd.z);
+		float angle = 3.14159265f + yaw;
+		layer.pose.orientation = {
+			0.0f,
+			sinf(angle * 0.5f),
+			0.0f,
+			cosf(angle * 0.5f)
+		};
+	} else {
+		// Fallback: default position facing -Z
+		layer.pose.position = { 0.0f, 1.0f, -0.80f };
+		layer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+	}
 
 	font = make_unique<SudoFontMeta>(loadResource(RES_O_FNT_UBUNTU, RES_T_FNTMETA), loadResource(RES_O_FNT_UBUNTU, RES_T_PNG));
 	layout = make_unique<KeyboardLayout>(loadResource(RES_O_KB_EN_GB, RES_T_KBLAYOUT));
@@ -143,8 +183,8 @@ VRKeyboard::VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength
 		OOVR_FAILED_XR_ABORT(xrEnumerateSwapchainImages(laserChain[i], laserImgCount, &laserImgCount,
 		    (XrSwapchainImageBaseHeader*)laserImgs.data()));
 
-		// Left = enchantment blue, Right = alchemy green — semi-transparent
-		uint8_t cr = (i == 0) ? 80 : 60, cg = (i == 0) ? 140 : 220, cb = (i == 0) ? 255 : 80, ca = 180;
+		// Warm white beam — semi-transparent
+		uint8_t cr = 255, cg = 240, cb = 220, ca = 180;
 		uint32_t packed = cr | (cg << 8) | (cb << 16) | (ca << 24);
 		uint32_t colorPixels[16];
 		for (int j = 0; j < 16; j++) colorPixels[j] = packed;
@@ -176,7 +216,7 @@ VRKeyboard::VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength
 		memset(&laserLayer[i], 0, sizeof(laserLayer[i]));
 		laserLayer[i].type = XR_TYPE_COMPOSITION_LAYER_QUAD;
 		laserLayer[i].layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-		laserLayer[i].space = xr_gbl->viewSpace;
+		laserLayer[i].space = xr_gbl->floorSpace;
 		laserLayer[i].eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 		laserLayer[i].subImage.swapchain = laserChain[i];
 		laserLayer[i].subImage.imageRect.offset = { 0, 0 };
@@ -209,6 +249,7 @@ wstring VRKeyboard::contents()
 void VRKeyboard::contents(wstring str)
 {
 	text = str;
+	cursorPos = (int)text.size();
 	dirty = true;
 }
 
@@ -235,18 +276,28 @@ static void InjectThumbstickAsDpad(vr::VRControllerState_t& state, float deadzon
 		state.ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_DPad_Up);
 }
 
+static inline float xr_dot(const XrVector3f& a, const XrVector3f& b)
+{
+	return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
 // Compute a quaternion that orients a quad so its Y axis aligns with beamDir
-// and the quad faces the viewer (who is at origin in viewSpace).
-static XrQuaternionf beamOrientation(XrVector3f beamDir, XrVector3f midpoint)
+// and the quad faces the viewer at viewerPos.
+static XrQuaternionf beamOrientation(XrVector3f beamDir, XrVector3f midpoint, XrVector3f viewerPos)
 {
 	// up = beamDir (height axis of quad)
 	XrVector3f up = beamDir;
 
-	// forward_raw = from midpoint toward viewer (origin in viewSpace)
-	float ml = sqrtf(midpoint.x * midpoint.x + midpoint.y * midpoint.y + midpoint.z * midpoint.z);
+	// forward = from midpoint toward viewer
+	XrVector3f toViewer = {
+		viewerPos.x - midpoint.x,
+		viewerPos.y - midpoint.y,
+		viewerPos.z - midpoint.z
+	};
+	float ml = sqrtf(toViewer.x * toViewer.x + toViewer.y * toViewer.y + toViewer.z * toViewer.z);
 	XrVector3f fwd;
 	if (ml > 0.001f) {
-		fwd = { -midpoint.x / ml, -midpoint.y / ml, -midpoint.z / ml };
+		fwd = { toViewer.x / ml, toViewer.y / ml, toViewer.z / ml };
 	} else {
 		fwd = { 0, 0, 1 };
 	}
@@ -342,26 +393,36 @@ void VRKeyboard::UpdateLaserBeam(int side)
 	laserLayer[side].pose.position = mid;
 	laserLayer[side].size.width = 0.003f; // 3mm thin
 	laserLayer[side].size.height = beamLen;
-	laserLayer[side].pose.orientation = beamOrientation(dir, mid);
+	laserLayer[side].pose.orientation = beamOrientation(dir, mid, headWorldPos);
 }
 
 const std::vector<XrCompositionLayerBaseHeader*>& VRKeyboard::Update()
 {
 	activeLayers.clear();
 
-	// Poll controller input directly — _HandleOverlayInput is never called
-	// by the engine, so the keyboard must poll its own input each frame.
 	BaseSystem* sys = GetUnsafeBaseSystem();
 	if (sys) {
 		float time = (float)(GetTickCount64() / 1000.0);
 
-		// Laser pointer selection — point controllers at the keyboard to select keys.
-		// Done before HandleOverlayInput so trigger activates the laser-pointed key.
+		// Update head position for beam billboard orientation
+		if (headLocked) {
+			// In viewSpace the head IS the origin
+			headWorldPos = { 0, 0, 0 };
+		} else {
+			XrSpaceLocation headLoc = { XR_TYPE_SPACE_LOCATION };
+			if (XR_SUCCEEDED(xrLocateSpace(xr_gbl->viewSpace, xr_gbl->floorSpace,
+			        xr_gbl->GetBestTime(), &headLoc))
+			    && (headLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+				headWorldPos = headLoc.pose.position;
+			}
+		}
+
+		// Laser pointer hit testing
 		bool anyLaserActive = false;
 		for (int side = 0; side < 2; side++) {
-			int hitKey = HitTestLaser(side);
-			if (hitKey >= 0 && hitKey != selected[side]) {
-				selected[side] = hitKey;
+			int hitResult = HitTestLaser(side);
+			if (hitResult >= 0 && hitResult != selected[side]) {
+				selected[side] = hitResult;
 				dirty = true;
 			}
 			if (laserActive[side]) {
@@ -370,22 +431,181 @@ const std::vector<XrCompositionLayerBaseHeader*>& VRKeyboard::Update()
 			}
 		}
 
-		// Re-render keyboard every frame when laser is active (for cursor dot)
 		if (anyLaserActive)
 			dirty = true;
 
-		// Left controller (device index 1)
-		vr::VRControllerState_t stateL = {};
-		if (sys->GetControllerState(1, &stateL, sizeof(stateL))) {
-			InjectThumbstickAsDpad(stateL);
-			HandleOverlayInput(vr::Eye_Left, stateL, time);
+		// Force redraw every 500ms for blinking cursor in non-minimal mode
+		if (!minimal) {
+			bool cursorBlink = ((GetTickCount64() / 500) % 2) == 0;
+			static bool lastCursorBlink = false;
+			if (cursorBlink != lastCursorBlink) {
+				lastCursorBlink = cursorBlink;
+				dirty = true;
+			}
 		}
 
-		// Right controller (device index 2)
-		vr::VRControllerState_t stateR = {};
-		if (sys->GetControllerState(2, &stateR, sizeof(stateR))) {
-			InjectThumbstickAsDpad(stateR);
-			HandleOverlayInput(vr::Eye_Right, stateR, time);
+		// Get controller states once for grab logic and input handling
+		vr::VRControllerState_t states[2] = {};
+		bool hasState[2] = { false, false };
+		hasState[0] = sys->GetControllerState(1, &states[0], sizeof(states[0]));
+		hasState[1] = sys->GetControllerState(2, &states[1], sizeof(states[1]));
+
+		// Grab bar logic — trigger to drag, toggle to switch head-lock mode
+		for (int side = 0; side < 2; side++) {
+			if (!hasState[side])
+				continue;
+
+			bool trigNow = (states[side].ulButtonPressed & vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger)) != 0;
+			bool trigJustPressed = trigNow && !lastTriggerState[side];
+			bool trigJustReleased = !trigNow && lastTriggerState[side];
+			lastTriggerState[side] = trigNow;
+
+			// Head-lock toggle — trigger press on the toggle button
+			if (trigJustPressed && laserOnToggle[side] && !grabActive) {
+				headLocked = !headLocked;
+				if (headLocked) {
+					// Switch to head-locked mode
+					grabActive = false;
+					grabbingSide = -1;
+					layer.space = xr_gbl->viewSpace;
+					layer.pose.position = { 0.0f, -0.35f, -0.80f };
+					layer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+					for (int i = 0; i < 2; i++)
+						laserLayer[i].space = xr_gbl->viewSpace;
+					headWorldPos = { 0, 0, 0 };
+				} else {
+					// Switch to world-anchored — spawn at current head position
+					layer.space = xr_gbl->floorSpace;
+					for (int i = 0; i < 2; i++)
+						laserLayer[i].space = xr_gbl->floorSpace;
+					XrSpaceLocation hl = { XR_TYPE_SPACE_LOCATION };
+					if (XR_SUCCEEDED(xrLocateSpace(xr_gbl->viewSpace, xr_gbl->floorSpace,
+					        xr_gbl->GetBestTime(), &hl))
+					    && (hl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+					    && (hl.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+						XrVector3f headFwd;
+						XrVector3f localFwd = { 0.0f, 0.0f, -1.0f };
+						rotate_vector_by_quaternion(localFwd, hl.pose.orientation, headFwd);
+						headFwd.y = 0;
+						float fwdLen = sqrtf(headFwd.x * headFwd.x + headFwd.z * headFwd.z);
+						if (fwdLen > 0.001f) { headFwd.x /= fwdLen; headFwd.z /= fwdLen; }
+						else { headFwd = { 0.0f, 0.0f, -1.0f }; }
+						layer.pose.position = {
+							hl.pose.position.x + headFwd.x * 0.80f,
+							hl.pose.position.y - 0.35f,
+							hl.pose.position.z + headFwd.z * 0.80f
+						};
+						float yaw = atan2f(headFwd.x, headFwd.z);
+						float angle = 3.14159265f + yaw;
+						layer.pose.orientation = {
+							0.0f, sinf(angle * 0.5f), 0.0f, cosf(angle * 0.5f)
+						};
+					}
+					headWorldPos = hl.pose.position;
+				}
+				dirty = true;
+				continue; // don't also start a grab this frame
+			}
+
+			// Text bar click — position the text cursor
+			if (trigJustPressed && laserOnTextBar[side] && !minimal) {
+				int clickTexX = (int)(laserU[side] * texWidth);
+				int BORD = 3;
+				int pad = 8;
+				int spaceW = font->Width(L' ');
+				int textStartX = pad + BORD + 6 + spaceW; // matches Refresh() cursor origin
+				int relX = clickTexX - textStartX;
+
+				// Walk through text characters to find nearest boundary
+				int accumX = 0;
+				int newPos = 0;
+				for (int i = 0; i < (int)text.size(); i++) {
+					int charW = font->Width(text[i]);
+					if (relX < accumX + charW / 2)
+						break;
+					accumX += charW;
+					newPos = i + 1;
+				}
+				cursorPos = newPos;
+				dirty = true;
+				continue;
+			}
+
+			// Grab — trigger on drag area to reposition (only in world mode)
+			// Uses laser ray-plane intersection so the keyboard follows the laser 1:1.
+			if (trigJustPressed && laserOnGrabBar[side] && !grabActive && !headLocked) {
+				// The laser already hit the keyboard — use that hit point
+				if (laserActive[side]) {
+					grabActive = true;
+					grabbingSide = side;
+					grabPlaneOrigin = layer.pose.position;
+					// Offset from hit point to keyboard center
+					grabOffset = {
+						layer.pose.position.x - laserHitPoint[side].x,
+						layer.pose.position.y - laserHitPoint[side].y,
+						layer.pose.position.z - laserHitPoint[side].z
+					};
+				}
+			}
+
+			if (grabActive && grabbingSide == side) {
+				if (trigJustReleased) {
+					grabActive = false;
+					grabbingSide = -1;
+				} else if (trigNow) {
+					// Intersect the laser ray with the ORIGINAL grab plane
+					// (not the current keyboard position — avoids feedback lag)
+					std::shared_ptr<BaseInput> input = GetBaseInput();
+					if (input && input->AreActionsLoaded()) {
+						XrSpace aimSpace = XR_NULL_HANDLE;
+						input->GetHandSpace((vr::TrackedDeviceIndex_t)(side + 1), aimSpace, true);
+						if (aimSpace != XR_NULL_HANDLE) {
+							XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
+							if (XR_SUCCEEDED(xrLocateSpace(aimSpace, layer.space,
+							        xr_gbl->GetBestTime(), &loc))
+							    && (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+							    && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+								XrVector3f rayOrig = loc.pose.position;
+								XrVector3f rayFwd = { 0, 0, -1 };
+								XrVector3f rayDir;
+								rotate_vector_by_quaternion(rayFwd, loc.pose.orientation, rayDir);
+
+								XrVector3f planeN;
+								rotate_vector_by_quaternion({ 0, 0, 1 }, layer.pose.orientation, planeN);
+								float d = xr_dot(rayDir, planeN);
+								if (fabsf(d) > 1e-6f) {
+									XrVector3f PO = {
+										grabPlaneOrigin.x - rayOrig.x,
+										grabPlaneOrigin.y - rayOrig.y,
+										grabPlaneOrigin.z - rayOrig.z
+									};
+									float t = xr_dot(PO, planeN) / d;
+									if (t > 0.0f) {
+										XrVector3f hit = {
+											rayOrig.x + t * rayDir.x,
+											rayOrig.y + t * rayDir.y,
+											rayOrig.z + t * rayDir.z
+										};
+										layer.pose.position = {
+											hit.x + grabOffset.x,
+											hit.y + grabOffset.y,
+											hit.z + grabOffset.z
+										};
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Controller input (trigger for typing)
+		for (int side = 0; side < 2; side++) {
+			if (!hasState[side])
+				continue;
+			// InjectThumbstickAsDpad(states[side]); // Disabled — laser pointers handle selection now
+			HandleOverlayInput(side == 0 ? vr::Eye_Left : vr::Eye_Right, states[side], time);
 		}
 	}
 
@@ -404,24 +624,26 @@ const std::vector<XrCompositionLayerBaseHeader*>& VRKeyboard::Update()
 	return activeLayers;
 }
 
+// Returns: key ID (>= 0), -1 (miss), -2 (grab bar drag area), -3 (toggle button)
 int VRKeyboard::HitTestLaser(int side)
 {
 	laserActive[side] = false;
+	laserOnGrabBar[side] = false;
+	laserOnToggle[side] = false;
+	laserOnTextBar[side] = false;
 
 	std::shared_ptr<BaseInput> input = GetBaseInput();
 	if (!input || !input->AreActionsLoaded())
 		return -1;
 
-	// Get the aim space for this controller (device index = side + 1)
 	XrSpace aimSpace = XR_NULL_HANDLE;
 	input->GetHandSpace((vr::TrackedDeviceIndex_t)(side + 1), aimSpace, true);
-
 	if (aimSpace == XR_NULL_HANDLE)
 		return -1;
 
-	// Locate the aim space relative to viewSpace (the keyboard's coordinate system)
+	// Locate controller in the keyboard's reference space (viewSpace or floorSpace)
 	XrSpaceLocation location = { XR_TYPE_SPACE_LOCATION };
-	XrResult result = xrLocateSpace(aimSpace, xr_gbl->viewSpace,
+	XrResult result = xrLocateSpace(aimSpace, layer.space,
 	    xr_gbl->GetBestTime(), &location);
 
 	if (XR_FAILED(result)
@@ -429,41 +651,48 @@ int VRKeyboard::HitTestLaser(int side)
 	    || !(location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
 		return -1;
 
-	// Ray origin = controller aim position in viewSpace
 	XrVector3f rayOrigin = location.pose.position;
-
-	// Ray direction = forward vector (-Z) of the aim pose, rotated by orientation
-	XrVector3f forward = { 0.0f, 0.0f, -1.0f };
+	XrVector3f fwd = { 0.0f, 0.0f, -1.0f };
 	XrVector3f rayDir;
-	rotate_vector_by_quaternion(forward, location.pose.orientation, rayDir);
+	rotate_vector_by_quaternion(fwd, location.pose.orientation, rayDir);
 
-	// Keyboard plane: normal is +Z (quad faces the viewer), at z = layer.pose.position.z
-	float planeZ = layer.pose.position.z;
-	float denom = rayDir.z;
+	// Oriented plane intersection — keyboard can face any direction in world space
+	XrVector3f kbCenter = layer.pose.position;
+	XrVector3f planeNormal, localRight, localUp;
+	rotate_vector_by_quaternion({ 0, 0, 1 }, layer.pose.orientation, planeNormal);
+	rotate_vector_by_quaternion({ 1, 0, 0 }, layer.pose.orientation, localRight);
+	rotate_vector_by_quaternion({ 0, 1, 0 }, layer.pose.orientation, localUp);
+
+	float denom = xr_dot(rayDir, planeNormal);
 	if (fabsf(denom) < 1e-6f)
-		return -1; // ray parallel to plane
+		return -1; // ray parallel to keyboard plane
 
-	float t = (planeZ - rayOrigin.z) / denom;
+	XrVector3f PO = { kbCenter.x - rayOrigin.x, kbCenter.y - rayOrigin.y, kbCenter.z - rayOrigin.z };
+	float t = xr_dot(PO, planeNormal) / denom;
 	if (t <= 0.0f)
 		return -1; // intersection behind the ray
 
-	// Hit point on the keyboard plane
-	float hitX = rayOrigin.x + t * rayDir.x;
-	float hitY = rayOrigin.y + t * rayDir.y;
+	XrVector3f hitPoint = {
+		rayOrigin.x + t * rayDir.x,
+		rayOrigin.y + t * rayDir.y,
+		rayOrigin.z + t * rayDir.z
+	};
 
-	// Convert to normalized keyboard coordinates [0,1]
-	float localX = hitX - layer.pose.position.x;
-	float localY = hitY - layer.pose.position.y;
-	float u = (localX + layer.size.width * 0.5f) / layer.size.width;
-	float v = (localY + layer.size.height * 0.5f) / layer.size.height;
+	// Project hit onto keyboard local axes for UV coordinates
+	XrVector3f HP = { hitPoint.x - kbCenter.x, hitPoint.y - kbCenter.y, hitPoint.z - kbCenter.z };
+	float localXCoord = xr_dot(HP, localRight);
+	float localYCoord = xr_dot(HP, localUp);
+
+	float u = (localXCoord + layer.size.width * 0.5f) / layer.size.width;
+	float v = (localYCoord + layer.size.height * 0.5f) / layer.size.height;
 
 	if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f)
 		return -1; // missed the quad
 
-	// Store laser hit data for beam rendering and cursor dot
+	// Store laser data for beam rendering and cursor dot
 	laserActive[side] = true;
 	laserOrigin[side] = rayOrigin;
-	laserHitPoint[side] = { hitX, hitY, planeZ };
+	laserHitPoint[side] = hitPoint;
 	laserU[side] = u;
 	laserV[side] = v;
 
@@ -471,11 +700,34 @@ int VRKeyboard::HitTestLaser(int side)
 	int texX = (int)(u * texWidth);
 	int texY = (int)((1.0f - v) * texHeight);
 
-	// Hit-test against keyboard keys
+	// Check grab bar region (top strip of texture)
+	if (texY < GRAB_BAR_HEIGHT) {
+		// Toggle button on the right side of the grab bar
+		int toggleLeft = (int)texWidth - TOGGLE_BTN_WIDTH - 8;
+		if (texX >= toggleLeft) {
+			laserOnToggle[side] = true;
+			return -3; // toggle button hit
+		}
+		laserOnGrabBar[side] = true;
+		return -2; // grab bar drag area
+	}
+
+	// Hit-test text input bar (only in non-minimal mode)
 	int padding = 8;
 	int kbWidth = layout->GetWidth();
 	int keySize = (((int)texWidth - padding) / kbWidth) - padding;
-	int keyAreaBaseY = minimal ? padding : padding + keySize + padding;
+	if (!minimal) {
+		int textBarY = GRAB_BAR_HEIGHT + padding;
+		int textBarH = keySize;
+		if (texY >= textBarY && texY < textBarY + textBarH
+		    && texX >= padding && texX < (int)texWidth - padding) {
+			laserOnTextBar[side] = true;
+			return -4; // text bar hit
+		}
+	}
+
+	// Hit-test against keyboard keys (shifted down by grab bar height)
+	int keyAreaBaseY = (minimal ? padding : padding + keySize + padding) + GRAB_BAR_HEIGHT;
 
 	for (const auto& key : layout->GetKeymap()) {
 		int kx = padding + (int)((keySize + padding) * key.x);
@@ -507,16 +759,17 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 #define GET_BTTN_LAST(var, key) \
 	GET_BTTN(var, key);         \
 	bool var##_last = lastButtons & ButtonMaskFromId(key)
-	GET_BTTN(left, k_EButton_DPad_Left);
-	GET_BTTN(right, k_EButton_DPad_Right);
-	GET_BTTN(up, k_EButton_DPad_Up);
-	GET_BTTN(down, k_EButton_DPad_Down);
+	// DPad navigation disabled — laser pointers handle selection now
+	// GET_BTTN(left, k_EButton_DPad_Left);
+	// GET_BTTN(right, k_EButton_DPad_Right);
+	// GET_BTTN(up, k_EButton_DPad_Up);
+	// GET_BTTN(down, k_EButton_DPad_Down);
 	GET_BTTN_LAST(trigger, k_EButton_SteamVR_Trigger);
 	GET_BTTN_LAST(grip, k_EButton_Grip);
 #undef GET_BTTN
 #undef GET_BTTN_LAST
 
-	if (grip && !grip_last) {
+	if (grip && !grip_last && !grabActive) {
 		closed = true;
 		SubmitEvent(VREvent_KeyboardClosed, 0);
 		return;
@@ -524,7 +777,9 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 
 	const KeyboardLayout::Key& key = layout->GetKeymap()[selected[side]];
 
-	if (trigger && !trigger_last) {
+	// Don't fire key presses when laser is on the grab bar, toggle button, or text bar
+	if (trigger && !trigger_last
+	    && !laserOnGrabBar[(int)side] && !laserOnToggle[(int)side] && !laserOnTextBar[(int)side]) {
 		wchar_t ch = caseMode == ECaseMode::LOWER ? key.ch : key.shift;
 
 		bool submitKeyEvent = false;
@@ -534,9 +789,10 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 			ECaseMode target = ch == '\x02' ? ECaseMode::LOCK : ECaseMode::SHIFT;
 			caseMode = caseMode == target ? ECaseMode::LOWER : target;
 		} else if (ch == '\b') {
-			// Backspace
-			if (!text.empty()) {
-				text.erase(text.end() - 1);
+			// Backspace — delete character before cursor
+			if (cursorPos > 0 && !text.empty()) {
+				text.erase(cursorPos - 1, 1);
+				cursorPos--;
 			}
 
 			submitKeyEvent = true;
@@ -556,7 +812,8 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 		} else if (!minimal && ch == '\n') {
 			// Silently soak up newlines for now
 		} else {
-			text += ch;
+			text.insert(cursorPos, 1, ch);
+			cursorPos++;
 
 			submitKeyEvent = true;
 
@@ -571,7 +828,9 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 		dirty = true;
 	}
 
-	// Movement:
+	// DPad movement disabled — laser pointers handle selection now
+	// Kept for future reference:
+	/*
 	bool any = left || right || up || down;
 	if (!any) {
 	cancel:
@@ -602,6 +861,7 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 
 	selected[side] = target;
 	dirty = true;
+	*/
 }
 
 void VRKeyboard::SetTransform(vr::HmdMatrix34_t transform)
@@ -672,6 +932,62 @@ void VRKeyboard::Refresh()
 	fillArea(0, 0, BORD, desc.Height, 140, 115, 45);                   // left
 	fillArea(desc.Width - BORD, 0, BORD, desc.Height, 140, 115, 45);   // right
 
+	// Grab bar at top — slightly lighter strip
+	fillArea(BORD, BORD, desc.Width - BORD * 2, GRAB_BAR_HEIGHT - BORD, 55, 48, 40);
+	// Golden separator at bottom of grab bar
+	fillArea(BORD, GRAB_BAR_HEIGHT - 2, desc.Width - BORD * 2, 2, 140, 115, 45);
+
+	// MOVE and LOCK buttons in the grab bar
+	{
+		int btnY = BORD + 5;
+		int btnH = GRAB_BAR_HEIGHT - BORD - 9;
+		// Vertically center text in the button using actual font metrics
+		int fontH = (int)font->GetLineHeight();
+		int textYOff = (btnH - fontH) / 2 + 4;
+
+		// Check if any laser is hovering over the drag area
+		bool moveHover = (!headLocked && (laserOnGrabBar[0] || laserOnGrabBar[1]));
+		bool lockHover = (laserOnToggle[0] || laserOnToggle[1]);
+
+		// ── MOVE button ──
+		int moveTextW = font->Width(L"MOVE");
+		int moveBtnW = moveTextW + 24;
+		int moveBtnX = 12;
+		fillArea(moveBtnX, btnY, moveBtnW, btnH, 140, 115, 45); // golden border
+		if (moveHover) {
+			fillArea(moveBtnX + 2, btnY + 2, moveBtnW - 4, btnH - 4, 120, 100, 40); // lit up
+		} else if (headLocked) {
+			fillArea(moveBtnX + 2, btnY + 2, moveBtnW - 4, btnH - 4, 38, 33, 28); // dark (disabled)
+		} else {
+			fillArea(moveBtnX + 2, btnY + 2, moveBtnW - 4, btnH - 4, 50, 44, 36); // normal
+		}
+		pix_t moveColour = moveHover
+		    ? pix_t{ 240, 220, 160, 255 }  // Bright gold on hover
+		    : headLocked
+		        ? pix_t{ 70, 60, 45, 255 }  // Dim when head-locked
+		        : pix_t{ 180, 155, 75, 255 }; // Golden
+		print(moveBtnX + (moveBtnW - moveTextW) / 2, btnY + textYOff, moveColour, L"MOVE", false);
+
+		// ── LOCK button ──
+		int lockBtnX = (int)desc.Width - TOGGLE_BTN_WIDTH - 8;
+		int lockBtnW = TOGGLE_BTN_WIDTH;
+		fillArea(lockBtnX, btnY, lockBtnW, btnH, 140, 115, 45); // golden border
+		if (headLocked) {
+			fillArea(lockBtnX + 2, btnY + 2, lockBtnW - 4, btnH - 4, 120, 100, 40); // active
+		} else if (lockHover) {
+			fillArea(lockBtnX + 2, btnY + 2, lockBtnW - 4, btnH - 4, 65, 56, 42); // hover hint
+		} else {
+			fillArea(lockBtnX + 2, btnY + 2, lockBtnW - 4, btnH - 4, 42, 37, 30); // inactive
+		}
+		pix_t lockColour = headLocked
+		    ? pix_t{ 240, 220, 160, 255 }
+		    : lockHover
+		        ? pix_t{ 200, 180, 120, 255 }
+		        : pix_t{ 130, 110, 70, 255 };
+		int lockTextW = font->Width(L"LOCK");
+		print(lockBtnX + (lockBtnW - lockTextW) / 2, btnY + textYOff, lockColour, L"LOCK", false);
+	}
+
 	int kbWidth = layout->GetWidth();
 	int keySize = ((desc.Width - padding) / kbWidth) - padding;
 	auto drawKey = [&](int x, int y, const KeyboardLayout::Key& key) {
@@ -701,17 +1017,9 @@ void VRKeyboard::Refresh()
 		bool leftSel = (selected[vr::Eye_Left] == key.id);
 		bool rightSel = (selected[vr::Eye_Right] == key.id);
 
-		if (leftSel && rightSel) {
-			// Both on same key — split
-			int halfW = (width - BORD * 2) / 2;
-			fillArea(x + BORD, y + BORD, halfW, height - BORD * 2, 30, 60, 120);
-			fillArea(x + BORD + halfW, y + BORD, width - BORD * 2 - halfW, height - BORD * 2, 30, 100, 55);
-		} else if (leftSel) {
-			// Left controller — deep enchantment blue
-			fillArea(x + BORD, y + BORD, width - BORD * 2, height - BORD * 2, 30, 60, 120);
-		} else if (rightSel) {
-			// Right controller — deep alchemy green
-			fillArea(x + BORD, y + BORD, width - BORD * 2, height - BORD * 2, 30, 100, 55);
+		if (leftSel || rightSel) {
+			// Cream gold highlight for selected key
+			fillArea(x + BORD, y + BORD, width - BORD * 2, height - BORD * 2, 95, 80, 40);
 		}
 
 		// Text color
@@ -730,7 +1038,7 @@ void VRKeyboard::Refresh()
 		print(x + (width - textWidth) / 2, y + padding, targetColour, label, false);
 	};
 
-	int keyAreaBaseY = minimal ? padding : padding + keySize + padding;
+	int keyAreaBaseY = (minimal ? padding : padding + keySize + padding) + GRAB_BAR_HEIGHT;
 	for (const KeyboardLayout::Key& key : layout->GetKeymap()) {
 		int x = padding + (int)((keySize + padding) * key.x);
 		int y = keyAreaBaseY + (int)((keySize + padding) * key.y);
@@ -739,13 +1047,30 @@ void VRKeyboard::Refresh()
 	}
 
 	if (!minimal) {
-		// Text input bar — golden border with dark interior
-		fillArea(padding, padding, desc.Width - padding * 2, keySize, 140, 115, 45);
-		fillArea(padding + BORD, padding + BORD, desc.Width - padding * 2 - BORD * 2, keySize - BORD * 2, 38, 33, 28);
+		// Text input bar — golden border with dark interior (shifted below grab bar)
+		int textBarY = GRAB_BAR_HEIGHT + padding;
+		fillArea(padding, textBarY, desc.Width - padding * 2, keySize, 140, 115, 45);
+		fillArea(padding + BORD, textBarY + BORD, desc.Width - padding * 2 - BORD * 2, keySize - BORD * 2, 38, 33, 28);
 
 		pix_t targetColour = { 220, 200, 155, 255 }; // Parchment text
 
-		print(padding + BORD + 6, padding + BORD + 4, targetColour, text);
+		print(padding + BORD + 6, textBarY + BORD + 4, targetColour, text);
+
+		// Blinking text cursor — 500ms on, 500ms off
+		bool cursorVisible = ((GetTickCount64() / 500) % 2) == 0;
+		if (cursorVisible) {
+			// Calculate cursor X position by measuring text up to cursorPos
+			// The +spaceW offset accounts for the font's XOffset shifting glyphs right
+			int spaceW = font->Width(L' ');
+			int cursorX = padding + BORD + 6 + spaceW;
+			for (int i = 0; i < cursorPos && i < (int)text.size(); i++)
+				cursorX += font->Width(text[i]);
+
+			int cursorY = textBarY + BORD + 2;
+			int cursorH = keySize - BORD * 2 - 4;
+			pix_t cursorColour = { 220, 200, 155, 255 }; // Same parchment color as text
+			fillArea(cursorX, cursorY, 2, cursorH, cursorColour.r, cursorColour.g, cursorColour.b);
+		}
 	}
 
 	// Draw laser cursor dots on the keyboard surface
@@ -757,10 +1082,8 @@ void VRKeyboard::Refresh()
 		int cy = (int)((1.0f - laserV[side]) * desc.Height);
 		int radius = 6;
 
-		// Blue for left, green for right — bright so they stand out
-		int cr = (side == 0) ? 100 : 80;
-		int cg = (side == 0) ? 180 : 255;
-		int cb = (side == 0) ? 255 : 100;
+		// Warm white cursor dot
+		int cr = 255, cg = 240, cb = 220;
 
 		// Filled circle
 		for (int dy = -radius; dy <= radius; dy++) {
