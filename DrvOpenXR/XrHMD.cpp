@@ -9,6 +9,7 @@
 #include "../OpenOVR/Reimpl/BaseSystem.h"
 #include "../OpenOVR/convert.h"
 #include "generated/static_bases.gen.h"
+#include <chrono>
 #include <thread>
 
 void XrHMD::GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* height)

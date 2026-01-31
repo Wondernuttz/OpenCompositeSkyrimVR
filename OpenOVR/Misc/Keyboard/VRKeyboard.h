@@ -1,8 +1,6 @@
 #pragma once
 
-#ifndef OC_XR_PORT
 #include <d3d11.h>
-#endif
 
 #include <codecvt>
 #include <functional>
@@ -10,6 +8,9 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "Misc/xr_ext.h"
+#include "Misc/xrutil.h"
 
 #include "KeyboardLayout.h"
 #include "SudoFontMeta.h"
@@ -26,17 +27,13 @@ public:
 		k_EGamepadTextInputModeSubmit = 2,
 	};
 
-#ifndef OC_XR_PORT
 	VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength, bool minimal, eventDispatch_t dispatch, EGamepadTextInputMode inputMode);
-#endif
 	~VRKeyboard();
 
 	std::wstring contents();
 	void contents(std::wstring);
 
-#ifndef OC_XR_PORT
-	ovrLayerHeader* Update();
-#endif
+	const std::vector<XrCompositionLayerBaseHeader*>& Update();
 
 	void HandleOverlayInput(vr::EVREye controllerDeviceIndex, vr::VRControllerState_t state, float time);
 
@@ -53,10 +50,8 @@ public:
 	void SetTransform(vr::HmdMatrix34_t transform);
 
 private:
-#ifndef OC_XR_PORT
 	ID3D11Device* const dev;
 	ID3D11DeviceContext* ctx;
-#endif
 
 	bool dirty = true;
 	bool closed = false;
@@ -70,11 +65,12 @@ private:
 	eventDispatch_t eventDispatch;
 	EGamepadTextInputMode inputMode;
 
-#ifndef OC_XR_PORT
-	ovrTextureSwapChain chain;
-	ovrTextureSwapChainDesc chainDesc;
-	ovrLayerQuad layer;
-#endif
+	// OpenXR swap chain and composition layer
+	XrSwapchain chain = XR_NULL_HANDLE;
+	uint32_t texWidth = 1024;
+	uint32_t texHeight = 512;
+	XrCompositionLayerQuad layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+	std::vector<XrSwapchainImageD3D11KHR> swapchainImages;
 
 	std::unique_ptr<SudoFontMeta> font;
 	std::unique_ptr<KeyboardLayout> layout;
@@ -85,7 +81,24 @@ private:
 	int selected[2];
 	uint64_t lastButtonState[2];
 
+	// Laser pointer data
+	bool laserActive[2] = { false, false };
+	float laserU[2] = {};
+	float laserV[2] = {};
+	XrVector3f laserOrigin[2] = {};
+	XrVector3f laserHitPoint[2] = {};
+
+	// Laser beam composition layers (one per hand)
+	XrSwapchain laserChain[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
+	XrCompositionLayerQuad laserLayer[2] = {};
+
+	// All layers returned by Update (keyboard + laser beams)
+	std::vector<XrCompositionLayerBaseHeader*> activeLayers;
+
 	void Refresh();
 
 	void SubmitEvent(vr::EVREventType ev, wchar_t ch);
+
+	int HitTestLaser(int side);
+	void UpdateLaserBeam(int side);
 };

@@ -161,7 +161,7 @@ ovr_enum_t BaseCompositor::GetLastPoseForTrackedDeviceIndex(TrackedDeviceIndex_t
 	return VRCompositorError_None;
 }
 
-#if !defined(OC_XR_PORT) && defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 DX11Compositor* BaseCompositor::dxcomp;
 #endif
 
@@ -191,13 +191,12 @@ Compositor* BaseCompositor::CreateCompositorAPI(const vr::Texture_t* texture)
 #if defined(SUPPORT_DX10) && !defined(OC_XR_PORT)
 		else
 			comp = new DX10Compositor((ID3D10Texture2D*)texture->handle);
-
-		dxcomp = (DX11Compositor*)comp;
 #else
 		else
 			STUBBED();
 #endif
 
+		dxcomp = (DX11Compositor*)comp;
 		break;
 	}
 #endif
